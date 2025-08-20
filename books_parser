@@ -1,0 +1,293 @@
+import requests
+from bs4 import BeautifulSoup
+import csv
+import json
+import os
+from urllib.parse import urljoin, urlparse
+import time
+from typing import List, Dict, Any, Optional
+import logging
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class BooksToScrapeParser:
+    BASE_URL = "https://books.toscrape.com/"
+
+    def __init__(self, delay: float = 1.0):
+        """
+        Инициализация парсера
+
+        Args:
+            delay: Задержка между запросами в секундах (для избежания блокировки)
+        """
+        self.delay = delay
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+
+    def _get_soup(self, url: str) -> Optional[BeautifulSoup]:
+        """
+        Получение BeautifulSoup объекта по URL
+
+        Args:
+            url: URL для парсинга
+
+        Returns:
+            BeautifulSoup объект или None при ошибке
+        """
+        try:
+            time.sleep(self.delay)
+            response = self.session.get(url)
+            response.raise_for_status()
+            return BeautifulSoup(response.content, 'lxml')
+        except requests.RequestException as e:
+            logger.error(f"Ошибка при запросе {url}: {e}")
+            return None
+
+    def parse_book_page(self, url: str) -> Optional[Dict[str, Any]]:
+        """
+        Парсинг страницы отдельной книги
+
+        Args:
+            url: URL страницы книги
+
+        Returns:
+            Словарь с информацией о книге или None при ошибке
+        """
+        soup = self._get_soup(url)
+        if not soup:
+            return None
+
+        try:
+            book_info = {}
+
+            # Основная информация
+            book_info['title'] = soup.find('h1').text.strip()
+            book_info['price'] = soup.find('p', class_='price_color').text.strip()
+            book_info['availability'] = soup.find('p', class_='instock availability').text.strip()
+
+            # Описание
+            description = soup.find('meta', attrs={'name': 'description'})['content'].strip()
+            book_info['description'] = description
+
+            # Таблица с дополнительной информацией
+            table = soup.find('table', class_='table table-striped')
+            for row in table.find_all('tr'):
+                key = row.find('th').text.strip().lower().replace(' ', '_')
+                value = row.find('td').text.strip()
+                book_info[key] = value
+
+            # Рейтинг
+            rating_class = soup.find('p', class_='star-rating')['class'][1]
+            book_info['rating'] = rating_class
+
+            # URL изображения
+            image = soup.find('img')['src']
+            book_info['image_url'] = urljoin(url, image)
+
+            # URL страницы
+            book_info['url'] = url
+
+            return book_info
+
+        except Exception as e:
+            logger.error(f"Ошибка при парсинге страницы {url}: {e}")
+            return None
+
+    def parse_category(self, category_url: str, max_books: int = None) -> List[Dict[str, Any]]:
+        """
+        Парсинг всех книг в категории
+
+        Args:
+            category_url: URL категории
+            max_books: Максимальное количество книг для парсинга (None - все)
+
+        Returns:
+            Список словарей с информацией о книгах
+        """
+        books = []
+        page_url = category_url
+
+        while page_url and (max_books is None or len(books) < max_books):
+            soup = self._get_soup(page_url)
+            if not soup:
+                break
+
+            # Поиск ссылок на книги
+            book_links = []
+            for h3 in soup.find_all('h3'):
+                link = h3.find('a')['href']
+                full_link = urljoin(page_url, link)
+                book_links.append(full_link)
+
+            # Парсинг каждой книги
+            for book_link in book_links:
+                if max_books is not None and len(books) >= max_books:
+                    break
+
+                book_data = self.parse_book_page(book_link)
+                if book_data:
+                    books.append(book_data)
+                    logger.info(f"Спарсена книга: {book_data['title']}")
+
+            # Поиск следующей страницы
+            next_button = soup.find('li', class_='next')
+            if next_button:
+                next_link = next_button.find('a')['href']
+                page_url = urljoin(page_url, next_link)
+            else:
+                page_url = None
+
+        return books
+
+    def get_categories(self) -> Dict[str, str]:
+        """
+        Получение списка всех категорий
+
+        Returns:
+            Словарь {название категории: URL}
+        """
+        soup = self._get_soup(self.BASE_URL)
+        if not soup:
+            return {}
+
+        categories = {}
+        sidebar = soup.find('div', class_='side_categories')
+        for link in sidebar.find_all('a'):
+            # Пропускаем главную категорию "Books"
+            if 'books_1' in link.get('href', ''):
+                continue
+
+            category_name = link.text.strip()
+            category_url = urljoin(self.BASE_URL, link['href'])
+            categories[category_name] = category_url
+
+        return categories
+
+    def parse_all_books(self, max_per_category: int = None) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Парсинг всех книг со всех категорий
+
+        Args:
+            max_per_category: Максимальное количество книг на категорию
+
+        Returns:
+            Словарь {название категории: список книг}
+        """
+        categories = self.get_categories()
+        all_books = {}
+
+        for category_name, category_url in categories.items():
+            logger.info(f"Парсинг категории: {category_name}")
+            books = self.parse_category(category_url, max_per_category)
+            all_books[category_name] = books
+
+        return all_books
+
+
+class DataExporter:
+    """Класс для экспорта данных в различные форматы"""
+
+    @staticmethod
+    def to_csv(data: List[Dict[str, Any]], filename: str) -> None:
+        """
+        Экспорт данных в CSV файл
+
+        Args:
+            data: Список словарей с данными
+            filename: Имя файла для сохранения
+        """
+        if not data:
+            logger.warning("Нет данных для экспорта в CSV")
+            return
+
+        # Получаем все возможные ключи из всех записей
+        fieldnames = set()
+        for item in data:
+            fieldnames.update(item.keys())
+        fieldnames = sorted(fieldnames)
+
+        with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(data)
+
+        logger.info(f"Данные сохранены в {filename}")
+
+    @staticmethod
+    def to_json(data: Any, filename: str, indent: int = 2) -> None:
+        """
+        Экспорт данных в JSON файл
+
+        Args:
+            data: Данные для экспорта
+            filename: Имя файла для сохранения
+            indent: Отступ для форматирования
+        """
+        with open(filename, 'w', encoding='utf-8') as jsonfile:
+            json.dump(data, jsonfile, ensure_ascii=False, indent=indent)
+
+        logger.info(f"Данные сохранены в {filename}")
+
+    @staticmethod
+    def export_by_category(all_books: Dict[str, List[Dict[str, Any]]],
+                           output_dir: str,
+                           format: str = 'json') -> None:
+        """
+        Экспорт данных по категориям в отдельные файлы
+
+        Args:
+            all_books: Словарь с книгами по категориям
+            output_dir: Директория для сохранения
+            format: Формат файлов ('json' или 'csv')
+        """
+        os.makedirs(output_dir, exist_ok=True)
+
+        for category_name, books in all_books.items():
+            # Создаем безопасное имя файла
+            safe_name = "".join(c if c.isalnum() else "_" for c in category_name)
+            filename = os.path.join(output_dir, f"{safe_name}.{format}")
+
+            if format.lower() == 'csv':
+                DataExporter.to_csv(books, filename)
+            else:
+                DataExporter.to_json(books, filename)
+
+
+def main():
+    """Основная функция для демонстрации работы парсера"""
+
+    # Создаем экземпляр парсера
+    parser = BooksToScrapeParser(delay=0.5)
+    exporter = DataExporter()
+
+    # Создаем директорию для результатов
+    os.makedirs('results', exist_ok=True)
+
+    # Вариант 1: Парсинг всех категорий
+    logger.info("Начинаем парсинг всех категорий...")
+    all_books = parser.parse_all_books(max_per_category=5)  # Ограничиваем для демонстрации
+
+    # Экспорт всех данных в JSON
+    exporter.to_json(all_books, 'results/all_books.json')
+
+    # Экспорт по категориям в отдельные CSV файлы
+    exporter.export_by_category(all_books, 'results/categories', 'csv')
+
+    # Вариант 2: Парсинг конкретной категории
+    logger.info("\nПарсим конкретную категорию...")
+    categories = parser.get_categories()
+    if categories:
+        first_category = list(categories.values())[0]
+        category_books = parser.parse_category(first_category, max_books=3)
+        exporter.to_csv(category_books, 'results/single_category.csv')
+
+    logger.info("Парсинг завершен!")
+
+
+if __name__ == "__main__":
+    main()
